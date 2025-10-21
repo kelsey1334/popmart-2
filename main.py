@@ -5,7 +5,7 @@ import base64
 import asyncio
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -16,6 +16,12 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+
+# TZ
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:
+    ZoneInfo = None  # Fallback: coi như UTC+7 tính tay (ít gặp)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("popmart-bot")
@@ -40,18 +46,24 @@ CAPTCHA_MAX_TRIES = int(os.getenv("CAPTCHA_MAX_TRIES", "4"))
 # Cho phép chạy lại cùng ngày ở lần upload sau (mặc định: cho phép)
 DISABLE_GLOBAL_DAY_DEDUP = os.getenv("DISABLE_GLOBAL_DAY_DEDUP", "1").strip() == "1"
 
-# Chỉ kiểm tra sự tồn tại của checkbox ckbDongY (không gửi name/value)
-# Nếu không thấy, dừng lại (mặc định bật).
-REQUIRE_CKBDONGY = os.getenv("REQUIRE_CKBDONGY", "1").strip() == "1"
+# ====== AUTO RUN WINDOW (VN time) ======
+# /auto sẽ chờ tới 12:59:59 Asia/Ho_Chi_Minh, chạy liên tục đến 13:30:00 rồi dừng
+AUTO_START_HHMMSS = os.getenv("AUTO_START_HHMMSS", "12:59:59")
+AUTO_END_HHMMSS = os.getenv("AUTO_END_HHMMSS", "13:30:00")
+AUTO_RETRY_SECONDS = float(os.getenv("AUTO_RETRY_SECONDS", "2.0"))  # khoảng nghỉ giữa các lần thử
 
-# Anti-dup theo phiên
+# Anti-dup theo phiên đang chạy trong cùng thời điểm
 ACTIVE_DAYS = set()
 COMPLETED_DAYS = set()
 ACTIVE_LOCK = threading.Lock()
 
-# Pending manual captcha
+# Pending manual captcha (nếu không dùng 2Captcha)
 PENDING_CAPTCHAS: Dict[str, Dict[str, Any]] = {}
 PENDING_LOCK = threading.Lock()
+
+# Tác vụ auto theo chat: cho phép /stopauto
+AUTO_TASKS: Dict[int, asyncio.Task] = {}
+AUTO_TASKS_LOCK = threading.Lock()
 
 # ===== Env rows (optional) =====
 POP_ROWS_JSON = os.getenv("POP_ROWS_JSON", "").strip()
@@ -148,6 +160,7 @@ class PopmartClient:
         r = self._ajax_get(payload)
         return r.text.strip()
 
+    # --- Extra endpoints to mirror real site ---
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), reraise=True)
     def gen_qr_image(self, value: str, text: str) -> Optional[str]:
         url = f"{self.root_base_url.rstrip('/')}/DangKy.aspx/GenQRImage"
@@ -186,15 +199,6 @@ def extract_all_sales_dates(html: str) -> List[str]:
         if txt and val:
             out.append(txt)
     return out
-
-
-def has_ckb_dongy(html: str) -> bool:
-    """Chỉ kiểm tra có input#ckbDongY type=checkbox (không đọc name/value)."""
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-        return soup.find("input", {"id": "ckbDongY", "type": "checkbox"}) is not None
-    except Exception:
-        return False
 
 
 def solve_captcha_via_2captcha(image_bytes: bytes) -> Optional[str]:
@@ -304,24 +308,20 @@ def _normalize_rows_list(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-# ======= Core run logic (shared by Excel + ENV) =======
-async def run_with_rows(update: Update, context: ContextTypes.DEFAULT_TYPE, rows: List[Dict[str, Any]]):
+# ======= Core run logic =======
+async def run_with_rows(update: Update, context: ContextTypes.DEFAULT_TYPE, rows: List[Dict[str, Any]]) -> bool:
+    """Chạy 1 vòng đăng ký; trả về True nếu có >=1 Success, else False."""
     for idx, r in enumerate(rows):
         r["__row_idx"] = idx
 
     client = PopmartClient(BASE_URL, POP_PAGE_PATH, AJAX_PATH, REQUEST_TIMEOUT)
 
-    # Tải main page và kiểm tra checkbox ckbDongY
-    main_html = await asyncio.to_thread(client.get_main_page)
-    if REQUIRE_CKBDONGY and not has_ckb_dongy(main_html):
-        await update.message.reply_text("❌ Không tìm thấy ô checkbox 'ckbDongY' trên form. Dừng lại theo yêu cầu.")
-        return
-
     # Sales dates
+    main_html = await asyncio.to_thread(client.get_main_page)
     all_days = extract_all_sales_dates(main_html)
     if not all_days:
         await update.message.reply_text("Không tìm thấy Sales Dates trên form.")
-        return
+        return False
 
     unique_days = list(dict.fromkeys(all_days))
 
@@ -338,9 +338,10 @@ async def run_with_rows(update: Update, context: ContextTypes.DEFAULT_TYPE, rows
 
     if not days_to_run:
         await update.message.reply_text("Không có ngày nào mới để chạy (đã chạy trước đó).")
-        return
+        return False
 
-    await update.message.reply_text(f"Tìm thấy {len(days_to_run)} ngày. Sẽ tạo {len(days_to_run)} task (mỗi ngày 1 task).")
+    # nhẹ nhàng để tránh spam
+    await update.message.reply_text(f"Bắt đầu 1 vòng submit • {len(days_to_run)} ngày • {len(rows)} dòng.")
 
     buckets: Dict[str, List[Dict[str, Any]]] = {d: list(rows) for d in days_to_run}
     report_rows: List[Dict[str, Any]] = []
@@ -355,7 +356,6 @@ async def run_with_rows(update: Update, context: ContextTypes.DEFAULT_TYPE, rows
             html = await asyncio.to_thread(client.get_main_page)
             id_ngay = client.map_sales_date_to_id(html, day)
             if not id_ngay:
-                await update.message.reply_text(f"[{day}] Không tìm thấy idNgàyBanHang.")
                 for row in tasks:
                     await add_report(
                         Day=day, DayId="", SessionValue="", SessionLabel="",
@@ -369,7 +369,6 @@ async def run_with_rows(update: Update, context: ContextTypes.DEFAULT_TYPE, rows
 
             sessions = await asyncio.to_thread(client.load_sessions_for_day, id_ngay)
             if not sessions:
-                await update.message.reply_text(f"[{day}] Không có phiên để đăng ký. Bỏ qua.")
                 for row in tasks:
                     await add_report(
                         Day=day, DayId=id_ngay, SessionValue="", SessionLabel="",
@@ -400,113 +399,81 @@ async def run_with_rows(update: Update, context: ContextTypes.DEFAULT_TYPE, rows
                         img_bytes = await asyncio.to_thread(client.download_image, img_url)
 
                         captcha_answer = await asyncio.to_thread(solve_captcha_via_2captcha, img_bytes) if USE_2CAPTCHA else None
-                        if not captcha_answer and USE_2CAPTCHA:
+                        if not USE_2CAPTCHA:
+                            # Tự động mà không 2Captcha -> không thể tiếp tục “tự chạy”
+                            last_msg = "Chế độ auto yêu cầu USE_2CAPTCHA=1."
+                            break
+                        if not captcha_answer:
                             last_msg = "2Captcha không trả lời."
                             continue
 
-                        if USE_2CAPTCHA and captcha_answer:
-                            result = await asyncio.to_thread(
-                                client.submit_registration,
-                                build_payload(id_ngay, sid, row, captcha_answer)
-                            )
-                            if "!!!True|~~|" in result:
-                                arr = result.split("|~~|")
-                                ma = arr[3].strip() if len(arr) > 3 else ""
-                                qr_url = await asyncio.to_thread(client.gen_qr_image, ma, ma)
-                                qr_abs = ""
-                                qr_bytes = None
-                                if qr_url:
-                                    qr_abs = qr_url if qr_url.startswith("http") else f"{client.root_base_url.rstrip('/')}{qr_url}"
-                                    try:
-                                        qr_bytes = await asyncio.to_thread(client.download_image, qr_abs)
-                                    except Exception:
-                                        qr_bytes = None
-                                cap = (
-                                    f"✅ [{day}] Dòng {row['__row_idx'] + 1}\n"
-                                    f"Mã tham dự: `{ma}`\nPhiên: {slabel} ({sid})"
-                                )
-                                if qr_bytes:
-                                    await update.message.reply_photo(photo=qr_bytes, caption=cap, parse_mode="Markdown")
-                                else:
-                                    await update.message.reply_text(cap)
+                        # Submit
+                        result = await asyncio.to_thread(
+                            client.submit_registration,
+                            build_payload(id_ngay, sid, row, captcha_answer)
+                        )
+                        if "!!!True|~~|" in result:
+                            arr = result.split("|~~|")
+                            ma = arr[3].strip() if len(arr) > 3 else ""
+                            # Gen QR
+                            qr_url = await asyncio.to_thread(client.gen_qr_image, ma, ma)
+                            qr_abs = ""
+                            qr_bytes = None
+                            if qr_url:
+                                qr_abs = qr_url if qr_url.startswith("http") else f"{client.root_base_url.rstrip('/')}{qr_url}"
                                 try:
-                                    _ = await asyncio.to_thread(client.send_email, sid, ma)
+                                    qr_bytes = await asyncio.to_thread(client.download_image, qr_abs)
                                 except Exception:
-                                    pass
-                                success = True
-                                await add_report(
-                                    Day=day, DayId=id_ngay, SessionValue=sid, SessionLabel=slabel,
-                                    Row=row["__row_idx"] + 1, FullName=row["FullName"],
-                                    DOB_Day=row["DOB_Day"], DOB_Month=row["DOB_Month"], DOB_Year=row["DOB_Year"],
-                                    Phone=row["Phone"], Email=row["Email"], IDNumber=row["IDNumber"],
-                                    Status="Success", Attempts=attempt, Message="OK",
-                                    MaThamDu=ma, QrUrl=qr_abs, Timestamp=datetime.now().isoformat(timespec="seconds"),
-                                )
-                                break
-                            elif is_session_full(result):
-                                await update.message.reply_text(
-                                    f"⛔ [{day}] Phiên đã hết lượt. Kết thúc xử lý ngày này."
-                                )
-                                await add_report(
-                                    Day=day, DayId=id_ngay, SessionValue=sid, SessionLabel=slabel,
-                                    Row=row["__row_idx"] + 1, FullName=row["FullName"],
-                                    DOB_Day=row["DOB_Day"], DOB_Month=row["DOB_Month"], DOB_Year=row["DOB_Year"],
-                                    Phone=row["Phone"], Email=row["Email"], IDNumber=row["IDNumber"],
-                                    Status="Skipped", Attempts=attempt, Message="Session full",
-                                    MaThamDu="", QrUrl="", Timestamp=datetime.now().isoformat(timespec="seconds"),
-                                )
-                                for row2 in tasks[idx_row + 1:]:
-                                    await add_report(
-                                        Day=day, DayId=id_ngay, SessionValue=sid, SessionLabel=slabel,
-                                        Row=row2["__row_idx"] + 1, FullName=row2["FullName"],
-                                        DOB_Day=row2["DOB_Day"], DOB_Month=row2["DOB_Month"], DOB_Year=row2["DOB_Year"],
-                                        Phone=row2["Phone"], Email=row2["Email"], IDNumber=row2["IDNumber"],
-                                        Status="Skipped", Attempts=0, Message="Session full",
-                                        MaThamDu="", QrUrl="", Timestamp=datetime.now().isoformat(timespec="seconds"),
-                                    )
-                                return
-                            elif "captcha" in result.lower():
-                                last_msg = f"Sai captcha (thử {attempt}/{CAPTCHA_MAX_TRIES})."
-                                continue
+                                    qr_bytes = None
+                            # Thông báo
+                            cap = f"✅ [{day}] Dòng {row['__row_idx'] + 1}\nMã tham dự: `{ma}`\nPhiên: {slabel} ({sid})"
+                            if qr_bytes:
+                                await update.message.reply_photo(photo=qr_bytes, caption=cap, parse_mode="Markdown")
                             else:
-                                last_msg = f"Không thành công: {result[:200]}"
-                                break
-                        else:
-                            # manual mode
-                            key = f"{update.effective_chat.id}:{day}:{row['__row_idx']}"
-                            with PENDING_LOCK:
-                                PENDING_CAPTCHAS[key] = {
-                                    "client": client,
-                                    "id_ngay": id_ngay,
-                                    "id_phien": sid,
-                                    "row": row,
-                                    "meta": {
-                                        "Day": day, "DayId": id_ngay, "SessionValue": sid, "SessionLabel": slabel,
-                                    },
-                                    "report_list": report_rows,
-                                    "report_lock": report_lock,
-                                }
-                            await update.message.reply_photo(
-                                photo=img_bytes,
-                                caption=f"[{day}] Dòng {row['__row_idx'] + 1}: Vui lòng trả lời tin nhắn này bằng **mã captcha**.",
-                                parse_mode="MarkdownV2",
+                                await update.message.reply_text(cap)
+                            try:
+                                _ = await asyncio.to_thread(client.send_email, sid, ma)
+                            except Exception:
+                                pass
+                            success = True
+                            await add_report(
+                                Day=day, DayId=id_ngay, SessionValue=sid, SessionLabel=slabel,
+                                Row=row["__row_idx"] + 1, FullName=row["FullName"],
+                                DOB_Day=row["DOB_Day"], DOB_Month=row["DOB_Month"], DOB_Year=row["DOB_Year"],
+                                Phone=row["Phone"], Email=row["Email"], IDNumber=row["IDNumber"],
+                                Status="Success", Attempts=attempt, Message="OK",
+                                MaThamDu=ma, QrUrl=qr_abs, Timestamp=datetime.now().isoformat(timespec="seconds"),
                             )
-                            last_msg = "Chuyển sang nhập tay."
+                            break
+                        elif is_session_full(result):
+                            last_msg = "Session full"
+                            await add_report(
+                                Day=day, DayId=id_ngay, SessionValue=sid, SessionLabel=slabel,
+                                Row=row["__row_idx"] + 1, FullName=row["FullName"],
+                                DOB_Day=row["DOB_Day"], DOB_Month=row["DOB_Month"], DOB_Year=row["DOB_Year"],
+                                Phone=row["Phone"], Email=row["Email"], IDNumber=row["IDNumber"],
+                                Status="Skipped", Attempts=attempt, Message="Session full",
+                                MaThamDu="", QrUrl="", Timestamp=datetime.now().isoformat(timespec="seconds"),
+                            )
+                            # sang dòng tiếp theo vẫn tiếp tục (retry vòng sau)
+                            break
+                        elif "captcha" in result.lower():
+                            last_msg = f"Sai captcha (thử {attempt}/{CAPTCHA_MAX_TRIES})."
+                            continue
+                        else:
+                            last_msg = f"Không thành công: {result[:200]}"
                             break
                     except Exception as e:
                         last_msg = f"Lỗi attempt {attempt}: {e}"
                         continue
 
-                if not success and USE_2CAPTCHA:
-                    await update.message.reply_text(
-                        f"⏭️ [{day}] Dòng {row['__row_idx'] + 1} — Bỏ qua sau {CAPTCHA_MAX_TRIES} lần thử. {last_msg}"
-                    )
+                if not success:
                     await add_report(
                         Day=day, DayId=id_ngay, SessionValue=sid, SessionLabel=slabel,
                         Row=row["__row_idx"] + 1, FullName=row["FullName"],
                         DOB_Day=row["DOB_Day"], DOB_Month=row["DOB_Month"], DOB_Year=row["DOB_Year"],
                         Phone=row["Phone"], Email=row["Email"], IDNumber=row["IDNumber"],
-                        Status="Failed", Attempts=attempt, Message=last_msg or "Max attempts",
+                        Status="Failed", Attempts=attempt, Message=last_msg or "Fail",
                         MaThamDu="", QrUrl="", Timestamp=datetime.now().isoformat(timespec="seconds"),
                     )
 
@@ -519,52 +486,96 @@ async def run_with_rows(update: Update, context: ContextTypes.DEFAULT_TYPE, rows
                     COMPLETED_DAYS.add(day)
 
     tasks = [context.application.create_task(process_day(d, buckets[d])) for d in days_to_run]
-    await update.message.reply_text("Đã khởi chạy các task theo ngày. Bot sẽ báo kết quả khi có.")
-
     _ = await asyncio.gather(*tasks, return_exceptions=True)
 
     if not report_rows:
-        await update.message.reply_text("Không có dữ liệu báo cáo (có thể tất cả bị chặn trước khi chạy).")
-        return
+        await update.message.reply_text("Không có dữ liệu báo cáo.")
+        return False
 
+    # Tóm tắt nhẹ (tránh spam file ở chế độ auto)
     df_report = pd.DataFrame(report_rows)
-    sort_cols = [c for c in ["Day", "Row"] if c in df_report.columns]
-    if sort_cols:
-        df_report = df_report.sort_values(sort_cols, kind="stable")
-
-    total = len(df_report)
     succ = int((df_report["Status"] == "Success").sum())
     fail = int((df_report["Status"] == "Failed").sum())
     skip = int((df_report["Status"] == "Skipped").sum())
-    summary = f"✅ Hoàn tất.\nTổng dòng: {total} — Thành công: {succ} • Thất bại: {fail} • Bỏ qua: {skip}"
+    await update.message.reply_text(f"Vòng submit xong • Success: {succ} • Failed: {fail} • Skipped: {skip}")
+    return succ > 0
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    xlsx_name = f"popmart_report_{ts}.xlsx"
-    out = io.BytesIO()
-    wrote = False
-    try:
-        with pd.ExcelWriter(out, engine="openpyxl") as writer:
-            df_report.to_excel(writer, index=False, sheet_name="Report")
-        wrote = True
-    except Exception:
+
+# ======= AUTO RUN WINDOW HELPERS =======
+VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh") if ZoneInfo else None
+
+
+def _parse_hhmmss(s: str) -> tuple:
+    hh, mm, ss = s.split(":")
+    return int(hh), int(mm), int(ss)
+
+
+def _vn_now() -> datetime:
+    if VN_TZ:
+        return datetime.now(VN_TZ)
+    # fallback: UTC+7 xấp xỉ
+    return datetime.utcnow() + timedelta(hours=7)
+
+
+def _window_today() -> (datetime, datetime):
+    now_vn = _vn_now()
+    sh, sm, ss = _parse_hhmmss(AUTO_START_HHMMSS)
+    eh, em, es = _parse_hhmmss(AUTO_END_HHMMSS)
+    start_dt = now_vn.replace(hour=sh, minute=sm, second=ss, microsecond=0)
+    end_dt = now_vn.replace(hour=eh, minute=em, second=es, microsecond=0)
+    if end_dt <= start_dt:
+        end_dt = end_dt + timedelta(days=1)
+    return start_dt, end_dt
+
+
+async def _sleep_until(target: datetime):
+    while True:
+        now_vn = _vn_now()
+        delta = (target - now_vn).total_seconds()
+        if delta <= 0:
+            return
+        await asyncio.sleep(min(delta, 1.0))
+
+
+async def auto_run_job(update: Update, context: ContextTypes.DEFAULT_TYPE, rows: List[Dict[str, Any]]):
+    chat_id = update.effective_chat.id
+    if not USE_2CAPTCHA:
+        await update.message.reply_text("⚠️ Chế độ /auto yêu cầu USE_2CAPTCHA=1. Hủy.")
+        return
+
+    start_dt, end_dt = _window_today()
+    now_vn = _vn_now()
+
+    # Nếu đã qua khung giờ hôm nay → chờ đợi tới ngày mai cùng giờ
+    if now_vn > end_dt:
+        start_dt = start_dt + timedelta(days=1)
+        end_dt = end_dt + timedelta(days=1)
+
+    await update.message.reply_text(f"⏰ Sẽ bắt đầu lúc {start_dt.strftime('%H:%M:%S %d/%m/%Y')} (VN). Kết thúc muộn nhất {end_dt.strftime('%H:%M:%S %d/%m/%Y')}.")
+
+    # Chờ tới 12:59:59 VN
+    await _sleep_until(start_dt)
+    await update.message.reply_text("🚀 Bắt đầu chạy liên tục…")
+
+    # Lặp cho đến khi thành công hoặc quá 13:30 VN
+    success_any = False
+    while _vn_now() < end_dt:
         try:
-            out = io.BytesIO()
-            with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
-                df_report.to_excel(writer, index=False, sheet_name="Report")
-            wrote = True
-        except Exception:
-            wrote = False
+            ok = await run_with_rows(update, context, rows)
+            if ok:
+                success_any = True
+                await update.message.reply_text("🎉 Đã đăng ký thành công. Dừng auto.")
+                break
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Lỗi vòng chạy: {e}")
+        await asyncio.sleep(AUTO_RETRY_SECONDS)
 
-    if wrote:
-        out.seek(0)
-        await update.message.reply_document(document=out, filename=xlsx_name, caption=summary)
-    else:
-        csv_bytes = df_report.to_csv(index=False).encode("utf-8-sig")
-        await update.message.reply_document(
-            document=io.BytesIO(csv_bytes),
-            filename=f"popmart_report_{ts}.csv",
-            caption=summary
-        )
+    if not success_any:
+        await update.message.reply_text("⏹️ Hết khung giờ (13:30 VN). Dừng auto.")
+
+    # xóa task registry
+    with AUTO_TASKS_LOCK:
+        AUTO_TASKS.pop(chat_id, None)
 
 
 # ===== Telegram Handlers =====
@@ -573,8 +584,8 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
         return
     msg = (
         "Gửi file Excel (.xlsx) cột: FullName, DOB_Day, DOB_Month, DOB_Year, Phone, Email, IDNumber.\n"
-        "Hoặc đã cấu hình biến môi trường POP_ROWS_JSON/POP_ROWS_BASE64/POP_ROWS_CSV thì dùng lệnh /batdau để chạy ngay.\n"
-        "Bot tự lấy mọi Sales Dates & chọn session đầu tiên. Mỗi ngày chạy 1 task và xử lý toàn bộ các dòng."
+        "Hoặc đã cấu hình POP_ROWS_JSON/BASE64/CSV thì dùng /batdau để chạy ngay.\n"
+        "Dùng /auto để hẹn chạy liên tục từ 12:59:59 tới 13:30 (giờ VN) cho đến khi đăng ký thành công."
     )
     await update.message.reply_text(msg)
 
@@ -611,20 +622,50 @@ async def cmd_batdau(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text(
             "❌ Không tìm thấy dữ liệu trong biến môi trường.\n"
-            "Hãy set một trong các biến: POP_ROWS_BASE64 (base64 JSON), POP_ROWS_JSON (JSON) hoặc POP_ROWS_CSV (CSV)."
+            "Set 1 trong: POP_ROWS_BASE64 (base64 JSON), POP_ROWS_JSON (JSON) hoặc POP_ROWS_CSV (CSV)."
         )
         return
 
     miss_any = any(any((r.get(c, "") == "" for c in REQUIRED_COLS)) for r in rows)
     if miss_any:
-        await update.message.reply_text(
-            "⚠️ Dữ liệu biến môi trường thiếu trường bắt buộc ở một số dòng. "
-            "Cần đủ các cột: " + ", ".join(REQUIRED_COLS)
-        )
+        await update.message.reply_text("⚠️ Một số dòng thiếu trường bắt buộc. Vẫn chạy.")
     await run_with_rows(update, context, rows)
 
 
+async def cmd_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    rows = parse_rows_from_env()
+    if not rows:
+        await update.message.reply_text("❌ /auto yêu cầu dữ liệu qua ENV POP_ROWS_*.")
+        return
+
+    chat_id = update.effective_chat.id
+    with AUTO_TASKS_LOCK:
+        if chat_id in AUTO_TASKS and not AUTO_TASKS[chat_id].done():
+            await update.message.reply_text("⚠️ Auto đang chạy hoặc chờ. Dùng /stopauto để dừng trước.")
+            return
+        task = context.application.create_task(auto_run_job(update, context, rows))
+        AUTO_TASKS[chat_id] = task
+    await update.message.reply_text("Đã lên lịch auto.")
+
+
+async def cmd_stopauto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    with AUTO_TASKS_LOCK:
+        task = AUTO_TASKS.get(chat_id)
+        if task and not task.done():
+            task.cancel()
+            await update.message.reply_text("🛑 Đã yêu cầu dừng auto.")
+        else:
+            await update.message.reply_text("ℹ️ Không có tác vụ auto nào đang chạy.")
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Chế độ manual captcha — không phù hợp với /auto (khuyến nghị USE_2CAPTCHA=1)
     if not is_admin(update.effective_user.id):
         return
     if not update.message or not update.message.text:
@@ -795,6 +836,8 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("batdau", cmd_batdau))
+    app.add_handler(CommandHandler("auto", cmd_auto))
+    app.add_handler(CommandHandler("stopauto", cmd_stopauto))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_excel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(on_error)
