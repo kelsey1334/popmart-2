@@ -1,4 +1,3 @@
-
 import os
 import io
 import json
@@ -22,7 +21,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("popmart-bot")
 
 # ===== Config =====
-# BASE_URL có thể là root (vd https://your-app) hoặc đã kèm /popmart (vd https://your-app/popmart)
 BASE_URL = os.getenv("BASE_URL", "https://popmartstt.com").rstrip("/")
 POP_PAGE_PATH = os.getenv("POP_PAGE_PATH", "/popmart").strip() or "/popmart"
 AJAX_PATH = os.getenv("AJAX_PATH", "/Ajax.aspx").strip() or "/Ajax.aspx"
@@ -42,37 +40,26 @@ CAPTCHA_MAX_TRIES = int(os.getenv("CAPTCHA_MAX_TRIES", "4"))
 # Cho phép chạy lại cùng ngày ở lần upload sau (mặc định: cho phép)
 DISABLE_GLOBAL_DAY_DEDUP = os.getenv("DISABLE_GLOBAL_DAY_DEDUP", "1").strip() == "1"
 
-# Anti-dup theo phiên đang chạy trong cùng thời điểm
+# Chỉ kiểm tra sự tồn tại của checkbox ckbDongY (không gửi name/value)
+# Nếu không thấy, dừng lại (mặc định bật).
+REQUIRE_CKBDONGY = os.getenv("REQUIRE_CKBDONGY", "1").strip() == "1"
+
+# Anti-dup theo phiên
 ACTIVE_DAYS = set()
 COMPLETED_DAYS = set()
 ACTIVE_LOCK = threading.Lock()
 
-# Pending manual captcha (nếu không dùng 2Captcha)
+# Pending manual captcha
 PENDING_CAPTCHAS: Dict[str, Dict[str, Any]] = {}
 PENDING_LOCK = threading.Lock()
 
 # ===== Env rows (optional) =====
-# Cấu hình dữ liệu đầu vào qua biến môi trường:
-# - POP_ROWS_JSON: JSON Array các object, ví dụ:
-#   [
-#     {"FullName":"A", "DOB_Day":"01","DOB_Month":"02","DOB_Year":"1999", "Phone":"090...", "Email":"a@x.com", "IDNumber":"00123"},
-#     {"FullName":"B", ...}
-#   ]
-# - hoặc POP_ROWS_BASE64: Base64 của JSON như trên (để dễ set trên hosting)
-# - hoặc POP_ROWS_CSV: nội dung CSV (header bắt buộc các cột như trên), mỗi dòng 1 record
 POP_ROWS_JSON = os.getenv("POP_ROWS_JSON", "").strip()
 POP_ROWS_BASE64 = os.getenv("POP_ROWS_BASE64", "").strip()
 POP_ROWS_CSV = os.getenv("POP_ROWS_CSV", "").strip()
 
 
 def _normalize_endpoints(base_url: str, pop_path: str, ajax_path: str):
-    """
-    Từ BASE_URL (root hoặc đã kèm /popmart) => tính:
-      - page_url: URL trang form (…/popmart)
-      - ajax_url: URL Ajax ở "root" (…/Ajax.aspx)
-      - ajax_alt_url: Ajax fallback nằm cùng thư mục với page (…/popmart/Ajax.aspx)
-      - root_base_url: origin + thư mục cha của page (để gọi /DangKy.aspx/GenQRImage)
-    """
     sp = urlsplit(base_url)
     base_path = sp.path.rstrip("/")
 
@@ -84,7 +71,6 @@ def _normalize_endpoints(base_url: str, pop_path: str, ajax_path: str):
     if not page_path.startswith("/"):
         page_path = "/" + page_path
 
-    # thư mục cha của page (root của app)
     root_path = base_path[:-len(pop_path)] if ends_with_pop else base_path
     if not root_path:
         root_path = "/"
@@ -162,13 +148,8 @@ class PopmartClient:
         r = self._ajax_get(payload)
         return r.text.strip()
 
-    # --- Extra endpoints to mirror real site ---
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), reraise=True)
     def gen_qr_image(self, value: str, text: str) -> Optional[str]:
-        """
-        POST JSON: {"GiaTri":"<MaThamDu>", "NoiDungHienBenDuoi":"<MaThamDu>"}
-        to /DangKy.aspx/GenQRImage -> returns {"d":"<url_png>"}
-        """
         url = f"{self.root_base_url.rstrip('/')}/DangKy.aspx/GenQRImage"
         headers = {"Content-Type": "application/json; charset=utf-8"}
         data = json.dumps({"GiaTri": value, "NoiDungHienBenDuoi": text})
@@ -202,9 +183,18 @@ def extract_all_sales_dates(html: str) -> List[str]:
     for opt in sel.find_all("option"):
         txt = (opt.text or "").strip()
         val = (opt.get("value") or "").strip()
-        if txt and val:  # skip placeholder
+        if txt and val:
             out.append(txt)
     return out
+
+
+def has_ckb_dongy(html: str) -> bool:
+    """Chỉ kiểm tra có input#ckbDongY type=checkbox (không đọc name/value)."""
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        return soup.find("input", {"id": "ckbDongY", "type": "checkbox"}) is not None
+    except Exception:
+        return False
 
 
 def solve_captcha_via_2captcha(image_bytes: bytes) -> Optional[str]:
@@ -273,8 +263,6 @@ REQUIRED_COLS = ["FullName", "DOB_Day", "DOB_Month", "DOB_Year", "Phone", "Email
 
 
 def parse_rows_from_env() -> List[Dict[str, Any]]:
-    """Đọc dữ liệu đầu vào từ biến môi trường POP_ROWS_JSON / POP_ROWS_BASE64 / POP_ROWS_CSV."""
-    # Prefer BASE64 > JSON > CSV
     if POP_ROWS_BASE64:
         try:
             raw = base64.b64decode(POP_ROWS_BASE64).decode("utf-8")
@@ -294,7 +282,6 @@ def parse_rows_from_env() -> List[Dict[str, Any]]:
 
     if POP_ROWS_CSV:
         try:
-            # Use pandas to parse CSV but force dtype=str to preserve leading zeros
             csv_df = pd.read_csv(io.StringIO(POP_ROWS_CSV), dtype=str)
             missing = [c for c in REQUIRED_COLS if c not in csv_df.columns]
             if missing:
@@ -307,13 +294,11 @@ def parse_rows_from_env() -> List[Dict[str, Any]]:
 
 
 def _normalize_rows_list(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Đảm bảo các khóa tồn tại, và mọi giá trị là string (giữ nguyên số 0 đầu)."""
     out: List[Dict[str, Any]] = []
     for r in rows:
         nr: Dict[str, Any] = {}
         for k in REQUIRED_COLS:
             v = r.get(k, "")
-            # chuyển mọi thứ về string để không mất 0 đầu
             nr[k] = "" if v is None else str(v)
         out.append(nr)
     return out
@@ -321,14 +306,18 @@ def _normalize_rows_list(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 # ======= Core run logic (shared by Excel + ENV) =======
 async def run_with_rows(update: Update, context: ContextTypes.DEFAULT_TYPE, rows: List[Dict[str, Any]]):
-    # Gắn chỉ số row
     for idx, r in enumerate(rows):
         r["__row_idx"] = idx
 
     client = PopmartClient(BASE_URL, POP_PAGE_PATH, AJAX_PATH, REQUEST_TIMEOUT)
 
-    # Sales dates
+    # Tải main page và kiểm tra checkbox ckbDongY
     main_html = await asyncio.to_thread(client.get_main_page)
+    if REQUIRE_CKBDONGY and not has_ckb_dongy(main_html):
+        await update.message.reply_text("❌ Không tìm thấy ô checkbox 'ckbDongY' trên form. Dừng lại theo yêu cầu.")
+        return
+
+    # Sales dates
     all_days = extract_all_sales_dates(main_html)
     if not all_days:
         await update.message.reply_text("Không tìm thấy Sales Dates trên form.")
@@ -341,9 +330,9 @@ async def run_with_rows(update: Update, context: ContextTypes.DEFAULT_TYPE, rows
     with ACTIVE_LOCK:
         for d in unique_days:
             if d in ACTIVE_DAYS:
-                continue  # đang chạy ở 1 tác vụ khác
+                continue
             if (not DISABLE_GLOBAL_DAY_DEDUP) and (d in COMPLETED_DAYS):
-                continue  # chỉ chặn nếu bật dedup toàn cục
+                continue
             ACTIVE_DAYS.add(d)
             days_to_run.append(d)
 
@@ -353,7 +342,6 @@ async def run_with_rows(update: Update, context: ContextTypes.DEFAULT_TYPE, rows
 
     await update.message.reply_text(f"Tìm thấy {len(days_to_run)} ngày. Sẽ tạo {len(days_to_run)} task (mỗi ngày 1 task).")
 
-    # Each day -> all rows
     buckets: Dict[str, List[Dict[str, Any]]] = {d: list(rows) for d in days_to_run}
     report_rows: List[Dict[str, Any]] = []
     report_lock = asyncio.Lock()
@@ -393,7 +381,7 @@ async def run_with_rows(update: Update, context: ContextTypes.DEFAULT_TYPE, rows
                     )
                 return
 
-            target_session = sessions[0]  # always pick first
+            target_session = sessions[0]
             sid = target_session["value"]
             slabel = target_session["label"]
 
@@ -422,10 +410,8 @@ async def run_with_rows(update: Update, context: ContextTypes.DEFAULT_TYPE, rows
                                 build_payload(id_ngay, sid, row, captcha_answer)
                             )
                             if "!!!True|~~|" in result:
-                                # Parse MaThamDu + HTML xác nhận
                                 arr = result.split("|~~|")
                                 ma = arr[3].strip() if len(arr) > 3 else ""
-                                # Gen QR
                                 qr_url = await asyncio.to_thread(client.gen_qr_image, ma, ma)
                                 qr_abs = ""
                                 qr_bytes = None
@@ -435,7 +421,6 @@ async def run_with_rows(update: Update, context: ContextTypes.DEFAULT_TYPE, rows
                                         qr_bytes = await asyncio.to_thread(client.download_image, qr_abs)
                                     except Exception:
                                         qr_bytes = None
-                                # Gửi về Telegram
                                 cap = (
                                     f"✅ [{day}] Dòng {row['__row_idx'] + 1}\n"
                                     f"Mã tham dự: `{ma}`\nPhiên: {slabel} ({sid})"
@@ -444,7 +429,6 @@ async def run_with_rows(update: Update, context: ContextTypes.DEFAULT_TYPE, rows
                                     await update.message.reply_photo(photo=qr_bytes, caption=cap, parse_mode="Markdown")
                                 else:
                                     await update.message.reply_text(cap)
-                                # SendEmail (best-effort)
                                 try:
                                     _ = await asyncio.to_thread(client.send_email, sid, ma)
                                 except Exception:
@@ -463,7 +447,6 @@ async def run_with_rows(update: Update, context: ContextTypes.DEFAULT_TYPE, rows
                                 await update.message.reply_text(
                                     f"⛔ [{day}] Phiên đã hết lượt. Kết thúc xử lý ngày này."
                                 )
-                                # mark current row as skipped-full
                                 await add_report(
                                     Day=day, DayId=id_ngay, SessionValue=sid, SessionLabel=slabel,
                                     Row=row["__row_idx"] + 1, FullName=row["FullName"],
@@ -472,7 +455,6 @@ async def run_with_rows(update: Update, context: ContextTypes.DEFAULT_TYPE, rows
                                     Status="Skipped", Attempts=attempt, Message="Session full",
                                     MaThamDu="", QrUrl="", Timestamp=datetime.now().isoformat(timespec="seconds"),
                                 )
-                                # mark remaining rows as skipped-full
                                 for row2 in tasks[idx_row + 1:]:
                                     await add_report(
                                         Day=day, DayId=id_ngay, SessionValue=sid, SessionLabel=slabel,
@@ -482,7 +464,7 @@ async def run_with_rows(update: Update, context: ContextTypes.DEFAULT_TYPE, rows
                                         Status="Skipped", Attempts=0, Message="Session full",
                                         MaThamDu="", QrUrl="", Timestamp=datetime.now().isoformat(timespec="seconds"),
                                     )
-                                return  # stop processing remaining rows for this day
+                                return
                             elif "captcha" in result.lower():
                                 last_msg = f"Sai captcha (thử {attempt}/{CAPTCHA_MAX_TRIES})."
                                 continue
@@ -499,7 +481,7 @@ async def run_with_rows(update: Update, context: ContextTypes.DEFAULT_TYPE, rows
                                     "id_phien": sid,
                                     "row": row,
                                     "meta": {
-                                        "Day": day, "DayId": id_ngay, "SessionValue": sid, "SessionLabel": slabel
+                                        "Day": day, "DayId": id_ngay, "SessionValue": sid, "SessionLabel": slabel,
                                     },
                                     "report_list": report_rows,
                                     "report_lock": report_lock,
@@ -533,22 +515,19 @@ async def run_with_rows(update: Update, context: ContextTypes.DEFAULT_TYPE, rows
         finally:
             with ACTIVE_LOCK:
                 ACTIVE_DAYS.discard(day)
-                # Chỉ đánh dấu COMPLETED khi BẬT dedup toàn cục
                 if not DISABLE_GLOBAL_DAY_DEDUP:
                     COMPLETED_DAYS.add(day)
 
-    # tạo task asyncio cho mỗi ngày và đợi hoàn tất để xuất báo cáo
     tasks = [context.application.create_task(process_day(d, buckets[d])) for d in days_to_run]
     await update.message.reply_text("Đã khởi chạy các task theo ngày. Bot sẽ báo kết quả khi có.")
 
     _ = await asyncio.gather(*tasks, return_exceptions=True)
-    # Tổng hợp & xuất báo cáo
+
     if not report_rows:
         await update.message.reply_text("Không có dữ liệu báo cáo (có thể tất cả bị chặn trước khi chạy).")
         return
 
     df_report = pd.DataFrame(report_rows)
-    # sắp xếp gọn
     sort_cols = [c for c in ["Day", "Row"] if c in df_report.columns]
     if sort_cols:
         df_report = df_report.sort_values(sort_cols, kind="stable")
@@ -559,7 +538,6 @@ async def run_with_rows(update: Update, context: ContextTypes.DEFAULT_TYPE, rows
     skip = int((df_report["Status"] == "Skipped").sum())
     summary = f"✅ Hoàn tất.\nTổng dòng: {total} — Thành công: {succ} • Thất bại: {fail} • Bỏ qua: {skip}"
 
-    # tạo file Excel (fallback CSV nếu thiếu engine)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     xlsx_name = f"popmart_report_{ts}.xlsx"
     out = io.BytesIO()
@@ -581,7 +559,6 @@ async def run_with_rows(update: Update, context: ContextTypes.DEFAULT_TYPE, rows
         out.seek(0)
         await update.message.reply_document(document=out, filename=xlsx_name, caption=summary)
     else:
-        # fallback CSV
         csv_bytes = df_report.to_csv(index=False).encode("utf-8-sig")
         await update.message.reply_document(
             document=io.BytesIO(csv_bytes),
@@ -612,7 +589,6 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     file = await doc.get_file()
-    # đọc Excel với dtype=str để giữ nguyên số 0 đầu
     df = pd.read_excel(io.BytesIO(await file.download_as_bytearray()), dtype=str)
 
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
@@ -628,7 +604,6 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_batdau(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Chạy dữ liệu đã được cài sẵn qua biến môi trường."""
     if not is_admin(update.effective_user.id):
         return
 
@@ -640,19 +615,16 @@ async def cmd_batdau(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Validate đủ cột
     miss_any = any(any((r.get(c, "") == "" for c in REQUIRED_COLS)) for r in rows)
     if miss_any:
         await update.message.reply_text(
             "⚠️ Dữ liệu biến môi trường thiếu trường bắt buộc ở một số dòng. "
             "Cần đủ các cột: " + ", ".join(REQUIRED_COLS)
         )
-        # vẫn tiếp tục chạy với các dòng đã có? Ở đây chọn chạy tất cả, vì build_payload đã str() mọi thứ
     await run_with_rows(update, context, rows)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manual captcha answer when not using 2Captcha."""
     if not is_admin(update.effective_user.id):
         return
     if not update.message or not update.message.text:
@@ -822,7 +794,7 @@ def main():
         raise SystemExit("Missing TELEGRAM_BOT_TOKEN")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("batdau", cmd_batdau))  # <-- new command
+    app.add_handler(CommandHandler("batdau", cmd_batdau))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_excel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(on_error)
